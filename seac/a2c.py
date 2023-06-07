@@ -33,7 +33,7 @@ def config():
 
     seac_coef = 1.0
 
-    num_processes = 4
+    num_processes = 4 # should match with num of agents
     num_steps = 5
 
     device = "cpu"
@@ -58,6 +58,8 @@ class A2C:
         self.action_size = flatdim(action_space)
         self.obs_space = obs_space
         self.action_space = action_space
+
+        self.n_broken = 0
 
         self.model = Policy(
             obs_space, action_space, base_kwargs={"recurrent": recurrent_policy},

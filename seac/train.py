@@ -24,8 +24,20 @@ from envs import make_vec_envs
 from wrappers import RecordEpisodeStatistics, SquashDones
 from model import Policy
 
-import robotic_warehouse # noqa
-import lbforaging # noqa
+import datetime
+
+import rware # custom robotic_warehouse
+
+# import robotic_warehouse # noqa
+# import lbforaging # noqa
+
+import wandb
+
+
+DO_WANDB = True
+WANDB_PROJECT_NAME = "multi-agent-with-stop-probability"
+WANDB_GROUP_NAME = "SEAC"
+WANDB_NAME = "seac_ex"
 
 ex = Experiment(ingredients=[algorithm])
 ex.captured_out_filter = lambda captured_output: "Output capturing turned off."
@@ -59,6 +71,8 @@ def config():
     eval_interval = int(1e6)
     episodes_per_eval = 8
 
+    n_threads = 4 # torch.get_num_threads() // 2
+
 
 for conf in glob.glob("configs/*.yaml"):
     name = f"{Path(conf).stem}"
@@ -69,7 +83,9 @@ def _squash_info(info):
     new_info = {}
     keys = set([k for i in info for k in i.keys()])
     keys.discard("TimeLimit.truncated")
+    keys.discard("break")
     for key in keys:
+        print([np.array(d[key]) for d in info if key in d])
         mean = np.mean([np.array(d[key]).sum() for d in info if key in d])
         new_info[key] = mean
     return new_info
@@ -141,6 +157,21 @@ def evaluate(
         f"Evaluation using {len(all_infos)} episodes: mean reward {info['episode_reward']:.5f}\n"
     )
 
+def setup_wandb(wandb_config):
+    server_time = datetime.datetime.now()
+    host_time = server_time + datetime.timedelta(hours=9)
+    resume_name = "seac_" + host_time.strftime("%Y_%m_%d_%H_%M_%S")
+    user_name = "hy-kiera"
+    wandb.login()
+    wandb.init(
+        project=WANDB_PROJECT_NAME,
+        group=WANDB_GROUP_NAME,
+        name=WANDB_NAME + host_time.strftime("%Y_%m_%d_%H_%M_%S"),
+        resume=resume_name,
+        entity=user_name,
+        config=wandb_config
+    )
+    
 
 @ex.automain
 def main(
@@ -159,7 +190,15 @@ def main(
     log_interval,
     save_interval,
     eval_interval,
+    n_threads,
 ):
+    # wandb
+    if DO_WANDB:
+        wandb_config = dict(
+            env_name=env_name,
+            num_env_steps=int(num_env_steps) // algorithm["num_steps"] // algorithm["num_processes"]
+        )
+        setup_wandb(wandb_config)
 
     if loss_dir:
         loss_dir = path.expanduser(loss_dir.format(id=str(_run._id)))
@@ -174,7 +213,9 @@ def main(
     utils.cleanup_log_dir(eval_dir)
     utils.cleanup_log_dir(save_dir)
 
-    torch.set_num_threads(1)
+    torch.set_num_threads(n_threads)
+
+    print("===Make envs===")
     envs = make_vec_envs(
         env_name,
         seed,
@@ -202,6 +243,9 @@ def main(
 
     all_infos = deque(maxlen=10)
 
+    break_counter = np.zeros(len(agents))
+
+    print("===Start to train===")
     for j in range(1, num_updates + 1):
 
         for step in range(algorithm["num_steps"]):
@@ -219,6 +263,11 @@ def main(
                 )
             # Obser reward and next obs
             obs, reward, done, infos = envs.step(n_action)
+
+            # count break time of each agent
+            for info in infos:
+                for i in range(len(info["break"])):
+                    break_counter[info["break"][i]-1] += 1
             # envs.envs[0].render()
 
             # If done then clean the history of observations.
@@ -262,6 +311,20 @@ def main(
         if j % log_interval == 0 and len(all_infos) > 1:
             squashed = _squash_info(all_infos)
 
+            if DO_WANDB:
+                # wandb
+                wandb.log({
+                    "episode_mean_reward": squashed['episode_reward'].sum(),
+                    "policy_loss": loss["policy_loss"],
+                    "value_loss": loss["value_loss"],
+                    "dist_entropy": loss["dist_entropy"],
+                    "importance_sampling": loss["importance_sampling"],
+                    "seac_policy_loss": loss["seac_policy_loss"],
+                    "seac_value_loss": loss["seac_value_loss"]
+                    }, step=j)
+                broken_log = {f"break_agent_{a}": break_counter[a] for a in range(len(agents))}
+                wandb.log(broken_log, step=j)
+
             total_num_steps = (
                 (j + 1) * algorithm["num_processes"] * algorithm["num_steps"]
             )
@@ -298,4 +361,9 @@ def main(
             videos = glob.glob(os.path.join(eval_dir, f"u{j}") + "/*.mp4")
             for i, v in enumerate(videos):
                 _run.add_artifact(v, f"u{j}.{i}.mp4")
+
+            if DO_WANDB:
+                # wandb
+                log_dict = {name: [wandb.Video(vid, fps=20, format="mp4") for vid in videos]}
+                wandb.log(log_dict, step=j)
     envs.close()
