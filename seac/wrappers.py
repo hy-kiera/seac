@@ -33,7 +33,7 @@ class RecordEpisodeStatistics(gym.Wrapper):
         observation, reward, done, info = super().step(action)
         self.episode_reward += np.array(reward, dtype=np.float64)
         self.episode_length += 1
-        if all(done):
+        if all(done): # when all episodes are done
             info["episode_reward"] = self.episode_reward
             for i, agent_reward in enumerate(self.episode_reward):
                 info[f"agent{i}/episode_reward"] = agent_reward
@@ -109,7 +109,6 @@ class ClearInfo(gym.Wrapper):
     def step(self, action):
         observation, reward, done, info = self.env.step(action)
         return observation, reward, done, {}
-
 
 class Monitor(GymMonitor):
     def _after_step(self, observation, reward, done, info):

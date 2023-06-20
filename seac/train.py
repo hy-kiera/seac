@@ -33,6 +33,7 @@ import rware # custom robotic_warehouse
 
 import wandb
 
+DO_SACRED = False
 
 DO_WANDB = True
 WANDB_PROJECT_NAME = "multi-agent-with-stop-probability"
@@ -60,18 +61,18 @@ def config():
     )
     dummy_vecenv = False
 
-    num_env_steps = 100e6
+    num_env_steps = 1e7 # 100e6
 
     eval_dir = "./results/video/{id}"
     loss_dir = "./results/loss/{id}"
     save_dir = "./results/trained_models/{id}"
 
     log_interval = 2000
-    save_interval = int(1e6)
-    eval_interval = int(1e6)
+    save_interval = int(1e5)
+    eval_interval = int(1e5)
     episodes_per_eval = 8
 
-    n_threads = 4 # torch.get_num_threads() // 2
+    n_threads = 8 # torch.get_num_threads() // 2
 
 
 for conf in glob.glob("configs/*.yaml"):
@@ -85,7 +86,6 @@ def _squash_info(info):
     keys.discard("TimeLimit.truncated")
     keys.discard("break")
     for key in keys:
-        print([np.array(d[key]) for d in info if key in d])
         mean = np.mean([np.array(d[key]).sum() for d in info if key in d])
         new_info[key] = mean
     return new_info
@@ -104,6 +104,7 @@ def evaluate(
     algorithm,
     _log,
 ):
+    print("===Evaluation===")
     device = algorithm["device"]
 
     eval_envs = make_vec_envs(
@@ -115,6 +116,10 @@ def evaluate(
         wrappers,
         device,
         monitor_dir=monitor_dir,
+        # error:
+        # libGL error: No matching fbConfigs or visuals found
+        # libGL error: failed to load driver: swrast
+        # but it works
     )
 
     n_obs = eval_envs.reset()
@@ -144,18 +149,27 @@ def evaluate(
         # Obser reward and next obs
         n_obs, _, done, infos = eval_envs.step(n_action)
 
+        # print(infos)
+        # print(reward)
+        # for i in range(len(infos)):
+        #     infos[i]["reward"] = reward[i]
+
         n_masks = torch.tensor(
             [[0.0] if done_ else [1.0] for done_ in done],
             dtype=torch.float32,
             device=device,
         )
-        all_infos.extend([i for i in infos if i])
+        if all(done):
+            all_infos.extend([i for i in infos if i])
 
     eval_envs.close()
     info = _squash_info(all_infos)
     _log.info(
         f"Evaluation using {len(all_infos)} episodes: mean reward {info['episode_reward']:.5f}\n"
     )
+
+    if DO_WANDB:
+        wandb.log({"val_episode_mean_reward": info["episode_reward"]})
 
 def setup_wandb(wandb_config):
     server_time = datetime.datetime.now()
@@ -196,7 +210,9 @@ def main(
     if DO_WANDB:
         wandb_config = dict(
             env_name=env_name,
-            num_env_steps=int(num_env_steps) // algorithm["num_steps"] // algorithm["num_processes"]
+            num_env_steps=int(num_env_steps) // algorithm["num_steps"] // algorithm["num_processes"],
+            reward_type="INDIVIDUAL",
+            val_evaluation_n_episodes=8
         )
         setup_wandb(wandb_config)
 
@@ -299,8 +315,11 @@ def main(
         for agent in agents:
             agent.compute_returns()
 
+        losses = []
         for agent in agents:
             loss = agent.update([a.storage for a in agents])
+            # print(loss)
+            losses.append(loss)
             for k, v in loss.items():
                 if writer:
                     writer.add_scalar(f"agent{agent.agent_id}/{k}", v, j)
@@ -308,22 +327,31 @@ def main(
         for agent in agents:
             agent.storage.after_update()
 
+        # if done.any(): # every 500 steps (=max episode length)
+        if j % 500 == 0:
+            if DO_WANDB:
+                broken_log = {f"break_agent_{a}": break_counter[a] // algorithm["num_processes"] for a in range(len(agents))}
+                wandb.log(broken_log, step=j)
+            break_counter = np.zeros(len(agents))
+
         if j % log_interval == 0 and len(all_infos) > 1:
             squashed = _squash_info(all_infos)
 
+            # agent_loss_log = {}
+            agent_loss_log = {"episode_reward": squashed['episode_reward']} # average of agents' episode reward
+            for a in range(len(agents)):
+                # agent_loss_log["episode_time"] = all_infos["episode_time"]
+                agent_loss_log[f"episode_reward_{a}"] = squashed['agent{a}/episode_reward']
+                agent_loss_log[f"policy_loss_{a}"] = losses[a]["policy_loss"]
+                agent_loss_log[f"value_loss_{a}"] = losses[a]["value_loss"]
+                agent_loss_log[f"dist_entropy_{a}"] = losses[a]["dist_entropy"]
+                agent_loss_log[f"importance_sampling_{a}"] = losses[a]["importance_sampling"]
+                agent_loss_log[f"seac_policy_loss_{a}"] = losses[a]["seac_policy_loss"]
+                agent_loss_log[f"seac_value_loss_{a}"] = losses[a]["seac_value_loss"]
+
             if DO_WANDB:
                 # wandb
-                wandb.log({
-                    "episode_mean_reward": squashed['episode_reward'].sum(),
-                    "policy_loss": loss["policy_loss"],
-                    "value_loss": loss["value_loss"],
-                    "dist_entropy": loss["dist_entropy"],
-                    "importance_sampling": loss["importance_sampling"],
-                    "seac_policy_loss": loss["seac_policy_loss"],
-                    "seac_value_loss": loss["seac_value_loss"]
-                    }, step=j)
-                broken_log = {f"break_agent_{a}": break_counter[a] for a in range(len(agents))}
-                wandb.log(broken_log, step=j)
+                wandb.log(agent_loss_log, step=j)
 
             total_num_steps = (
                 (j + 1) * algorithm["num_processes"] * algorithm["num_steps"]
@@ -336,21 +364,23 @@ def main(
                 f"Last {len(all_infos)} training episodes mean reward {squashed['episode_reward'].sum():.3f}"
             )
 
-            for k, v in squashed.items():
-                _run.log_scalar(k, v, j)
+            if DO_SACRED:
+                for k, v in squashed.items():
+                    _run.log_scalar(k, v, j)
             all_infos.clear()
 
-        if save_interval is not None and (
-            j > 0 and j % save_interval == 0 or j == num_updates
-        ):
-            cur_save_dir = path.join(save_dir, f"u{j}")
-            for agent in agents:
-                save_at = path.join(cur_save_dir, f"agent{agent.agent_id}")
-                os.makedirs(save_at, exist_ok=True)
-                agent.save(save_at)
-            archive_name = shutil.make_archive(cur_save_dir, "xztar", save_dir, f"u{j}")
-            shutil.rmtree(cur_save_dir)
-            _run.add_artifact(archive_name)
+        if DO_SACRED:
+            if save_interval is not None and (
+                j > 0 and j % save_interval == 0 or j == num_updates
+            ):
+                cur_save_dir = path.join(save_dir, f"u{j}")
+                for agent in agents:
+                    save_at = path.join(cur_save_dir, f"agent{agent.agent_id}")
+                    os.makedirs(save_at, exist_ok=True)
+                    agent.save(save_at)
+                archive_name = shutil.make_archive(cur_save_dir, "xztar", save_dir, f"u{j}")
+                shutil.rmtree(cur_save_dir)
+                _run.add_artifact(archive_name)
 
         if eval_interval is not None and (
             j > 0 and j % eval_interval == 0 or j == num_updates
@@ -359,8 +389,9 @@ def main(
                 agents, os.path.join(eval_dir, f"u{j}"),
             )
             videos = glob.glob(os.path.join(eval_dir, f"u{j}") + "/*.mp4")
-            for i, v in enumerate(videos):
-                _run.add_artifact(v, f"u{j}.{i}.mp4")
+            if DO_SACRED:
+                for i, v in enumerate(videos):
+                    _run.add_artifact(v, f"u{j}.{i}.mp4")
 
             if DO_WANDB:
                 # wandb
